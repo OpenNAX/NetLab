@@ -1,3 +1,4 @@
-release_notes.txt
-OpenNAX-NetLab-v2.0.0.zip
-OpenNAX-NetLab-v2.0.0.zip.sha256
+OpenNAX-Internal/
+.DS_Store
+.gitignore
+.vscode
