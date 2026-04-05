@@ -1,15 +1,9 @@
 clear
 
-if [ ! -d "venv" ]; then
-    echo "Error: Virtual environment (venv) not found."
-    echo "Please run the install script first."
-    exit 1
-fi
+echo "Starting OpenNAX NetLab | v3.0.0"
 
-echo "Starting OpenNAX NetLab | v2.0.0"
+sleep 1
 
-source venv/bin/activate
+clear
 
 python3 netlab.py
-
-deactivate

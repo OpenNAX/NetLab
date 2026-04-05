@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import socket
 import logging
@@ -6,6 +7,8 @@ import requests
 import threading
 import subprocess
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
+
 
 BLACK = "\033[0;30m"
 RED = "\033[0;31m"
@@ -33,7 +36,7 @@ def clear():
     os.system("clear")
 
 clear()
-version = "v2.0.0"
+version = "v3.0.0"
 
 opennax = f"""{LIGHT_CYAN}
     ███████                                  ██████   █████   █████████   █████ █████
@@ -50,38 +53,24 @@ opennax = f"""{LIGHT_CYAN}
 {RESET}"""
 
 print(opennax)
-print(f"{CYAN}Starting NetLab · {version}...{RESET}")
+print(f"{CYAN}[*] Starting NetLab · {version}...{RESET}")
 
-LOG_DIR = "netlab_logs"
-SENSITIVE_LOG_DIR = "netlab_sensitive_logs"
+LOG_DIR = "logs"
 if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR)
-if not os.path.exists(SENSITIVE_LOG_DIR):
-    os.makedirs(SENSITIVE_LOG_DIR)
 
-main_logger_name = 'netlab_main'
-sensitive_logger_name = 'netlab_sensitive'
 
 alerted_levels = set()
 
 def setup_logger():
     log_filename = f"{LOG_DIR}/network_logs_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
-    main_logger = logging.getLogger(main_logger_name)
+    main_logger = logging.getLogger(LOG_DIR)
     main_logger.setLevel(logging.INFO)
     if not main_logger.handlers:
-        main_handler = logging.FileHandler(log_filename)
-        main_formatter = logging.Formatter("%(message)s")
+        main_handler = RotatingFileHandler(log_filename, maxBytes=5*1024*1024, backupCount=3)
+        main_formatter = logging.Formatter("%(asctime)s - %(message)s", datefmt='%Y-%m-%d %H:%M:%S')
         main_handler.setFormatter(main_formatter)
         main_logger.addHandler(main_handler)
-
-    sensitive_log_filename = f"{SENSITIVE_LOG_DIR}/sens_network_logs_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
-    sensitive_logger = logging.getLogger(sensitive_logger_name)
-    sensitive_logger.setLevel(logging.INFO)
-    if not sensitive_logger.handlers:
-        sensitive_handler = logging.FileHandler(sensitive_log_filename)
-        sensitive_formatter = logging.Formatter("%(asctime)s - %(message)s", datefmt='%Y-%m-%d %H:%M:%S')
-        sensitive_handler.setFormatter(sensitive_formatter)
-        sensitive_logger.addHandler(sensitive_handler)
 
 
 def get_local_ip_addresses():
@@ -103,38 +92,67 @@ def get_public_ip():
         return "N/A"
 
 current_public_ip = "N/A"
+initial_mobile_state = None
+
+
+def fetch_mobile_network_info_once():
+    try:
+        mobile_info_raw = subprocess.check_output(["termux-telephony-deviceinfo"], timeout=5).decode("utf-8")
+        mobile_info = json.loads(mobile_info_raw)
+        return {
+            "operator": mobile_info.get("network_operator_name", "Unknown"),
+            "network_type": mobile_info.get("network_type", "Unknown").upper(),
+            "data_enabled": mobile_info.get("data_enabled", "Unknown"),
+            "sim_state": mobile_info.get("sim_state", "Unknown")
+        }
+    except Exception:
+        return None
 
 def log_session_start():
     global current_public_ip
-    intro()
     start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
     local_ips = get_local_ip_addresses()
     public_ip = get_public_ip()
+
     current_public_ip = public_ip
 
-    main_logger = logging.getLogger(main_logger_name)
-    sensitive_logger = logging.getLogger(sensitive_logger_name)
+    battery_info = get_battery_status()
+    if battery_info and battery_info.get('percentage') is not None:
+        batt_str = f"{battery_info.get('percentage')}% ({battery_info.get('status', 'UNKNOWN').upper()})"
+    else:
+        batt_str = "Unknown"
+
+    global initial_mobile_state
+    initial_mobile_state = fetch_mobile_network_info_once()
+    if initial_mobile_state:
+        mob_str = f"Operator: {initial_mobile_state['operator']}, Network: {initial_mobile_state['network_type']}, Data: {initial_mobile_state['data_enabled']}, SIM: {initial_mobile_state['sim_state']}"
+    else:
+        mob_str = "Unknown"
+
+    main_logger = logging.getLogger(LOG_DIR)
 
     print(
         f"{CYAN}--- STARTING MONITOR ---\n"
         f"· Time: {start_time}\n"
         f"· Local IP(s): {', '.join(local_ips)}\n"
         f"· Public IP: {public_ip}\n"
+        f"· Battery: {batt_str}\n"
+        f"· Mobile: {mob_str}\n"
         f"{RESET}"
     )
 
     main_logger.info(f"--- STARTING MONITOR ---")
     main_logger.info(f"Time: {start_time}")
     main_logger.info(f"Local IP(s): {', '.join(local_ips)}")
+    main_logger.info(f"Public IP: {public_ip}")
+    main_logger.info(f"Battery: {batt_str}")
+    main_logger.info(f"Mobile: {mob_str}")
 
-    sensitive_logger.info(f"--- SESSION START ---")
-    sensitive_logger.info(f"Public IP: {public_ip}")
-    sensitive_logger.info(f"Local IP(s): {', '.join(local_ips)}")
 
 def ping_dns(dns_server, timeout=2):
     try:
         command = ["ping", "-c", "1", "-W", str(timeout), dns_server]
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
         for line in result.stdout.splitlines():
             if "time=" in line:
@@ -144,39 +162,24 @@ def ping_dns(dns_server, timeout=2):
                 except (IndexError, ValueError):
                     pass
         return None
-
-    except subprocess.CalledProcessError as e:
-        logging.getLogger(main_logger_name).warning(f"Ping command failed for {dns_server}: {e.stderr}")
-        return None
-
-    except FileNotFoundError:
-        logging.getLogger(main_logger_name).error(f"Ping command not found.")
-        return None
-
     except Exception as e:
-        logging.getLogger(main_logger_name).error(f"Error pinging {dns_server}: {e}")
         return None
 
 def check_packet_loss(dns_server, count=5, timeout=2):
     try:
         command = ["ping", "-c", str(count), "-W", str(timeout), dns_server]
         result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                if "packet loss" in line:
-                    try:
-                        packet_loss = int(line.split(", ")[2].split("%")[0])
-                        return packet_loss
-                    except (IndexError, ValueError):
-                        pass
+        match = re.search(r'(\d+)%\s*packet loss', result.stdout)
+        if match:
+            return int(match.group(1))
         return 100
 
     except FileNotFoundError:
-        logging.getLogger(main_logger_name).error(f"Ping command not found for packet loss check.")
+        logging.getLogger(LOG_DIR).error(f"Ping command not found for packet loss check.")
         return 100
 
     except Exception as e:
-        logging.getLogger(main_logger_name).error(f"Error checking packet loss for {dns_server}: {e}")
+        logging.getLogger(LOG_DIR).error(f"Error checking packet loss for {dns_server}: {e}")
         return 100
 
 def test_web_connectivity(url="http://www.google.com", timeout=5):
@@ -186,32 +189,39 @@ def test_web_connectivity(url="http://www.google.com", timeout=5):
         return result.returncode == 0
 
     except FileNotFoundError:
-        logging.getLogger(main_logger_name).error(f"Curl command not found for web connectivity test.")
+        logging.getLogger(LOG_DIR).error(f"Curl command not found for web connectivity test.")
         return False
-        
+
     except Exception as e:
-        logging.getLogger(main_logger_name).error(f"Error testing web connectivity to {url}: {e}")
+        logging.getLogger(LOG_DIR).error(f"Error testing web connectivity to {url}: {e}")
         return False
 
 def get_best_dns():
-    main_logger = logging.getLogger(main_logger_name)
+    main_logger = logging.getLogger(LOG_DIR)
     dns_servers = [
         {"name": "Quad9", "ip": "9.9.9.9"},
         {"name": "Cloudflare DNS", "ip": "1.1.1.1"},
         {"name": "OpenDNS", "ip": "208.67.222.222"},
-        {"name": "Google DNS", "ip": "8.8.8.8"}
-    ]
-
-    emergency_dns = [
+        {"name": "Google DNS", "ip": "8.8.8.8"},
         {"name": "Emergency DNS 1", "ip": "198.142.0.51"},
         {"name": "Emergency DNS 2", "ip": "198.142.0.52"}
     ]
 
     results = {}
-    for server in dns_servers + emergency_dns:
+    threads = []
+
+    def check_server(server):
         latency = ping_dns(server["ip"], timeout=2)
         if latency is not None:
             results[server["ip"]] = (server, latency)
+
+    for server in dns_servers:
+        t = threading.Thread(target=check_server, args=(server,))
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join()
 
     if results:
         best_dns = min(results.values(), key=lambda x: x[1])[0]
@@ -227,13 +237,60 @@ def get_best_dns():
         return None
 
 def monitor_dns_latency():
-    global current_public_ip
-    main_logger = logging.getLogger(main_logger_name)
-    sensitive_logger = logging.getLogger(sensitive_logger_name)
-    max_failures, failure_count, current_dns = 5, 0, None
-    latencies = []
-    interval = 5
-    last_summary_time = datetime.now()
+    main_logger = logging.getLogger(LOG_DIR)
+    max_failures, failure_count = 5, 0
+    current_dns = "1.1.1.1"
+
+    def background_dns_eval():
+        nonlocal current_dns, failure_count
+        new_best = get_best_dns()
+        if new_best and new_best != current_dns:
+            current_dns = new_best
+            failure_count = 0
+
+    threading.Thread(target=background_dns_eval, daemon=True).start()
+
+    while True:
+        if not current_dns:
+            current_dns = get_best_dns()
+            if not current_dns:
+                print(f"{YELLOW}Waiting for coverage...{RESET}")
+                threading.Event().wait(10)
+                continue
+
+        latency = ping_dns(current_dns)
+
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+
+        if latency is not None:
+            if failure_count >= 2:
+                print(f"{LIGHT_GREEN}[{timestamp}] Connection restored!{RESET}")
+                main_logger.info(f"[{timestamp}] Connection restored!")
+            failure_count = 0
+            status_color = LIGHT_GREEN if latency < 50 else (BROWN if latency < 100 else RED)
+            print(f"{status_color}[{timestamp}] Ping to {current_dns}: {latency:.1f} ms{RESET}")
+            main_logger.info(f"[{timestamp}] Ping to {current_dns}: {latency} ms")
+        else:
+            failure_count += 1
+            print(f"{RED}[{timestamp}] Ping to {current_dns}: Failed{RESET}")
+            main_logger.info(f"[{timestamp}] Ping to {current_dns}: Failed")
+            
+            if failure_count == 2:
+                print(f"{YELLOW}[ALERT] [{timestamp}] Connection unstable / Packet loss detected!{RESET}")
+                main_logger.warning(f"[{timestamp}] Connection unstable / Packet loss detected!")
+
+        if failure_count >= max_failures:
+            print(f"{RED}[{timestamp}] Too many failures. Reevaluating DNS...{RESET}")
+            main_logger.warning(f"[{timestamp}] Too many ping failures to {current_dns}. Reevaluating DNS.")
+            current_dns, failure_count = None, 0
+
+        threading.Event().wait(3)
+
+def get_mobile_network_info():
+    global current_public_ip, initial_mobile_state
+    main_logger = logging.getLogger(LOG_DIR)
+    previous_state = initial_mobile_state
+    retry_delay = 5
     last_public_ip_check_time = datetime.now()
     public_ip_check_interval = 60
 
@@ -245,80 +302,8 @@ def monitor_dns_latency():
             if new_public_ip != "N/A" and new_public_ip != current_public_ip:
                 print(f"{YELLOW}[ALERT] [{timestamp}] Public IP changed: {current_public_ip} -> {new_public_ip}{RESET}")
                 main_logger.warning(f"[{timestamp}] Public IP changed: {current_public_ip} -> {new_public_ip}")
-                sensitive_logger.warning(f"[{timestamp}] Public IP changed: {current_public_ip} -> {new_public_ip}")
                 current_public_ip = new_public_ip
             last_public_ip_check_time = datetime.now()
-
-
-        if not current_dns:
-            current_dns = get_best_dns()
-            if not current_dns:
-                print(f"{YELLOW}Waiting for coverage...{RESET}")
-                threading.Event().wait(10)
-                continue
-
-        latency = ping_dns(current_dns)
-
-        if latency is not None:
-            failure_count = 0
-            latencies.append(latency)
-            main_logger.info(f"[{timestamp}] Ping to {current_dns}: {latency} ms")
-
-        else:
-            failure_count += 1
-            main_logger.info(f"[{timestamp}] Ping to {current_dns}: Failed")
-
-        if (datetime.now() - last_summary_time).total_seconds() >= interval:
-            avg_latency = sum(latencies) / len(latencies) if latencies else None
-            
-            status = "Unknown"
-            status_color = RED
-            if avg_latency is not None:
-                if avg_latency < 50:
-                    status = "Good"
-                    status_color = LIGHT_GREEN
-
-                elif avg_latency < 100:
-                    status = "Medium"
-                    status_color = BROWN
-                else:
-                    status = "Bad"
-                    status_color = RED
-
-            print(f"{status_color}[{timestamp}] Ping summary: Average: {avg_latency:.1f} ms ({status}){RESET}" if avg_latency is not None else f"{RED}[{timestamp}] Ping failed.{RESET}")
-            main_logger.info(f"[{timestamp}] Ping summary: Average: {avg_latency:.1f} ms ({status})" if avg_latency is not None else f"[{timestamp}] Ping failed.")
-
-            packet_loss = check_packet_loss(current_dns)
-            if packet_loss is not None and packet_loss > 50:
-                print(f"{RED}[ALERT] [{timestamp}] High packet loss ({packet_loss}%){RESET}")
-                main_logger.warning(f"[{timestamp}] High packet loss ({packet_loss}%)")
-            elif packet_loss is None:
-                 main_logger.warning(f"[{timestamp}] Packet loss check failed for {current_dns}")
-
-
-            if not test_web_connectivity():
-                print(f"{RED}[ALERT] [{timestamp}] Web connectivity failed.{RESET}")
-                main_logger.warning(f"[{timestamp}] Web connectivity failed.")
-
-            latencies.clear()
-            last_summary_time = datetime.now()
-
-        if failure_count >= max_failures:
-            print(f"{RED}Too many failures. Reevaluating DNS...{RESET}")
-            main_logger.warning(f"[{timestamp}] Too many ping failures to {current_dns}. Reevaluating DNS.")
-            current_dns, failure_count = None, 0
-            latencies.clear()
-
-        threading.Event().wait(1)
-
-def get_mobile_network_info():
-    main_logger = logging.getLogger(main_logger_name)
-    sensitive_logger = logging.getLogger(sensitive_logger_name)
-    previous_state = None
-    retry_delay = 5
-
-    while True:
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
         mobile_info_raw = None
         success = False
 
@@ -372,70 +357,8 @@ def get_mobile_network_info():
 
         threading.Event().wait(60)
 
-def evaluate_network_quality():
-    main_logger = logging.getLogger(main_logger_name)
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-
-    dns_server = "8.8.8.8"
-    avg_latency = ping_dns(dns_server)
-    packet_loss = check_packet_loss(dns_server)
-
-    if avg_latency is not None:
-        latency_status = "Good" if avg_latency < 50 else "Bad"
-    print(f"{LIGHT_GREEN}[{timestamp}] Latency: {avg_latency:.1f} ms ({latency_status}){RESET}" if avg_latency is not None else f"{RED}[{timestamp}] Latency test failed.{RESET}")
-    main_logger.info(f"[{timestamp}] Latency test to {dns_server}: {avg_latency:.1f} ms ({latency_status})" if avg_latency is not None else f"[{timestamp}] Latency test to {dns_server} failed.")
-
-    if packet_loss is not None:
-        packet_loss_status = "Good" if packet_loss < 10 else "Bad"
-    print(f"{LIGHT_GREEN if packet_loss < 10 else RED}[{timestamp}] Packet loss: {packet_loss}% ({packet_loss_status}){RESET}" if packet_loss is not None else f"{RED}[{timestamp}] Packet loss test failed.{RESET}")
-    main_logger.info(f"[{timestamp}] Packet loss test to {dns_server}: {packet_loss}% ({packet_loss_status})" if packet_loss is not None else f"[{timestamp}] Packet loss test to {dns_server} failed.")
-
-    download_test_url = "http://speed.cloudflare.com/__down?bytes=100000"
-    speed_MBps, speed_Mbps = test_download_speed(download_test_url, timeout=10)
-
-    print(f"{LIGHT_GREEN}[{timestamp}] Download speed: {speed_MBps:.2f} MB/s ({speed_Mbps:.2f} Mbps){RESET}" if speed_MBps is not None else f"{RED}[{timestamp}] Download test failed.{RESET}")
-    main_logger.info(f"[{timestamp}] Download speedtest: {speed_MBps:.2f} MB/s ({speed_Mbps:.2f} Mbps)" if speed_MBps is not None else f"[{timestamp}] Download speedtest failed.")
-
-def test_download_speed(url="http://speed.cloudflare.com/__down?bytes=100000", timeout=10):
-    main_logger = logging.getLogger(main_logger_name)
-    null_device = '/dev/null' if os.path.exists('/dev/null') else 'NUL'
-    try:
-        start_time = datetime.now()
-        file_size_bytes = 100000
-
-        command = ["curl", "-o", null_device, "--max-time", str(timeout), url]
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=True
-        )
-        end_time = datetime.now()
-
-        download_time_seconds = (end_time - start_time).total_seconds()
-        if download_time_seconds > 0:
-            speed_bytes_per_sec = file_size_bytes / download_time_seconds
-            speed_MBps = speed_bytes_per_sec / (1024 * 1024)
-            speed_Mbps = speed_MBps * 8
-            return speed_MBps, speed_Mbps
-        else:
-             return 0.0, 0.0
-
-    except subprocess.CalledProcessError as e:
-        main_logger.error(f"Curl command failed during download test: {e.stderr}")
-        return None, None
-
-    except FileNotFoundError:
-        main_logger.error(f"Curl command not found for download speedtest.")
-        return None, None
-
-    except Exception as e:
-        main_logger.error(f"Download speedtest failed: {e}")
-        return None, None
-
 def get_battery_status():
-    main_logger = logging.getLogger(main_logger_name)
+    main_logger = logging.getLogger(LOG_DIR)
     try:
         result_raw = subprocess.check_output(["termux-battery-status"], timeout=5).decode("utf-8")
         battery_info = json.loads(result_raw)
@@ -461,9 +384,16 @@ def get_battery_status():
 
 def monitor_battery():
     global alerted_levels
-    main_logger = logging.getLogger(main_logger_name)
+    main_logger = logging.getLogger(LOG_DIR)
     interval_seconds = 60
     thresholds = [10, 20, 30, 40, 50, 60, 70, 80, 90]
+
+    init_batt = get_battery_status()
+    if init_batt and init_batt.get("percentage") is not None:
+        p = init_batt.get("percentage")
+        for l in thresholds:
+            if p <= l:
+                alerted_levels.add(l)
 
     while True:
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
@@ -477,11 +407,15 @@ def monitor_battery():
                 main_logger.info(f"[{timestamp}] Battery: {percentage}% ({status})")
 
                 if status == "DISCHARGING":
-                    for level in thresholds:
-                        if percentage <= level and level not in alerted_levels:
-                            print(f"{YELLOW}[ALERT] [{timestamp}] Battery level low: {percentage}% (Discharging){RESET}")
-                            main_logger.warning(f"[{timestamp}] Battery level low: {percentage}% (Discharging)")
-                            alerted_levels.add(level)
+                    for level in sorted(thresholds, reverse=True):
+                        if percentage <= level:
+                            if level not in alerted_levels:
+                                print(f"{YELLOW}[{timestamp}] Battery info: {percentage}% (Discharging){RESET}")
+                                main_logger.info(f"[{timestamp}] Battery info: {percentage}% (Discharging)")
+                                for l in thresholds:
+                                    if percentage <= l:
+                                        alerted_levels.add(l)
+                            break
 
 
                 levels_to_remove = set()
@@ -509,9 +443,7 @@ def monitor_battery():
 def monitor_network():
     setup_logger()
     log_session_start()
-    main_logger = logging.getLogger(main_logger_name)
-
-    evaluate_network_quality()
+    main_logger = logging.getLogger(LOG_DIR)
 
     mobile_thread = threading.Thread(target=get_mobile_network_info, daemon=True)
     dns_thread = threading.Thread(target=monitor_dns_latency, daemon=True)
@@ -534,7 +466,7 @@ def monitor_network():
                  main_logger.warning("Battery monitoring thread has stopped unexpectedly.")
 
         except KeyboardInterrupt:
-             print(f"\n{RED}Monitoring stopping...{RESET}")
+             print(f"\n{RED}[-] Monitoring stopping...{RESET}")
              main_logger.info("KeyboardInterrupt received. Stopping monitoring.")
              break
 
@@ -544,15 +476,11 @@ try:
 
 except KeyboardInterrupt:
     print(f"\n{RED}Monitoring stopped by user (outer block){RESET}")
-    logging.getLogger(main_logger_name).info("Monitoring stopped by user (outer block).")
-    logging.getLogger(sensitive_logger_name).info("--- SESSION END ---")
+    logging.getLogger(LOG_DIR).info("Monitoring stopped by user (outer block).")
 
 finally:
-    main_logger = logging.getLogger(main_logger_name)
-    sensitive_logger = logging.getLogger(sensitive_logger_name)
+    main_logger = logging.getLogger(LOG_DIR)
     if main_logger.hasHandlers():
          main_logger.info("--- MONITORING ENDED ---")
 
-    if sensitive_logger.hasHandlers():
-         sensitive_logger.info("--- SESSION END ---")
-    print(f"{CYAN}Monitoring finished.{RESET}")
+    print(f"{CYAN}[*] Monitoring finished.{RESET}")
